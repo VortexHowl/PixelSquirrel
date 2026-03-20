@@ -84,8 +84,11 @@ async function rpcCall(body, timeoutMs = 8000) {
         clearTimeout(timer);
         if (res.status === 429) { await new Promise(r => setTimeout(r, 600 * (attempt + 1))); continue; }
         const data = await res.json();
-        if (data?.result !== undefined) return data;  // success
-        lastErr = new Error('Null result from ' + url);
+        // RPC-level error (rate limit message, invalid params, etc.) — try next endpoint
+        if (data?.error) { lastErr = new Error(data.error.message || JSON.stringify(data.error)); continue; }
+        // result must be present (null is valid for some methods, undefined means bad response)
+        if (data?.result === undefined) { lastErr = new Error('Missing result from ' + url); continue; }
+        return data;  // success
       } catch (e) {
         lastErr = e;
         if (attempt === 0) await new Promise(r => setTimeout(r, 400));
@@ -118,7 +121,8 @@ app.get('/api/leaderboard', (_, res) => {
 // ── POST /api/score ──────────────────────────────────────────
 app.post('/api/score', (req, res) => {
   let { wallet, handle, score, acorns, dist } = req.body;
-  if (!wallet) return res.status(400).json({ error: 'wallet required' });
+  if (!wallet || !/^[1-9A-HJ-NP-Za-km-z]{32,88}$/.test(wallet))
+    return res.status(400).json({ error: 'valid wallet required' });
 
   handle = String(handle || 'Anon').replace(/[^\w\s\-.]/g, '').trim().slice(0, 20) || 'Anon';
   score  = Math.max(0, Math.floor(+score  || 0));
@@ -287,7 +291,8 @@ app.post('/api/send-tx', async (req, res) => {
       method: 'sendTransaction',
       params: [encoded, { encoding: 'base64', preflightCommitment: 'confirmed' }]
     });
-    if (data.error) return res.status(400).json({ error: data.error.message || 'RPC error' });
+    // rpcCall already throws on RPC-level errors; guard against unexpected null result
+    if (!data.result) return res.status(502).json({ error: 'No signature returned from RPC' });
     res.json({ signature: data.result });
   } catch(e) {
     console.warn('send-tx error:', e.message);
@@ -296,17 +301,20 @@ app.post('/api/send-tx', async (req, res) => {
 });
 
 // ── POST /api/confirm-tx ─────────────────────────────────────
+// Budget: Railway has a 30s request timeout. Each rpcCall with 5s timeout +
+// 3 endpoints + 2 attempts = ~32s worst case, so we cap at 12 polls of 2s
+// each = 24s happy-path max, well within budget.
 app.post('/api/confirm-tx', async (req, res) => {
   const { signature } = req.body;
   if (!signature) return res.status(400).json({ error: 'signature required' });
   try {
     let attempts = 0;
-    while (attempts < 30) {
+    while (attempts < 12) {
       const data = await rpcCall({
         jsonrpc: '2.0', id: 1,
         method: 'getSignatureStatuses',
         params: [[signature], { searchTransactionHistory: true }]
-      });
+      }, 5000);  // tight per-call timeout so we fit in Railway's 30s window
       const status = data?.result?.value?.[0];
       if (status) {
         if (status.err) return res.status(400).json({ error: 'Transaction failed on-chain', detail: status.err });
@@ -316,7 +324,8 @@ app.post('/api/confirm-tx', async (req, res) => {
       await new Promise(r => setTimeout(r, 2000));
       attempts++;
     }
-    res.status(408).json({ error: 'Confirmation timeout' });
+    // Soft timeout: tell client to poll independently rather than erroring hard
+    res.status(408).json({ error: 'Confirmation timeout — check your wallet for the transaction' });
   } catch(e) {
     console.warn('confirm-tx error:', e.message);
     res.status(502).json({ error: 'RPC error: ' + e.message });
@@ -1643,8 +1652,8 @@ document.getElementById('btn-start').addEventListener('click',function(){
 document.getElementById('btn-restart').addEventListener('click',startGame);
 document.getElementById('btn-continue').addEventListener('click', function(){
   document.getElementById('scr-ready').classList.remove('show');
-  gState = 'playing';
   if(rafId){ cancelAnimationFrame(rafId); rafId=null; }
+  gState = 'playing';
   rafId = requestAnimationFrame(loop);
 });
 
@@ -1900,18 +1909,29 @@ async function buyExtraLife(livesCount) {
   }
   if (livesRemaining < livesCount) { toast('🚫 Only ' + livesRemaining + ' lives available this hour.', 3500); return; }
   if (zepBal < totalZep) { toast('❌ Need ' + totalZep + ' ZEP — you have ' + zepBal.toFixed(0), 3500); return; }
-  // Close life picker modal
   document.getElementById('modal-lives').classList.remove('show');
 
   var btn = document.getElementById('btn-buy-life');
   btn.disabled = true; btn.textContent = '⏳ PREPARING…';
 
+  // ── Helper: deserialize instruction from server JSON ──
+  function deserializeIx(raw) {
+    return new solanaWeb3.TransactionInstruction({
+      programId: new solanaWeb3.PublicKey(raw.programId),
+      keys: raw.keys.map(function(k) { return {
+        pubkey:     new solanaWeb3.PublicKey(k.pubkey),
+        isSigner:   k.isSigner,
+        isWritable: k.isWritable,
+      }; }),
+      data: new Uint8Array(raw.data),
+    });
+  }
+
   try {
-    // ── Step 1: Server builds instructions via official npm spl-token ──
-    // Zero manual byte packing. Server uses @solana/spl-token to produce
-    // createAssociatedTokenAccountIdempotent + TransferChecked instructions,
-    // serializes them, and sends the data to the client.
-    btn.textContent = '⏳ PREPARING…';
+    // ── Step 1: Build instructions (slow — fetch mint decimals etc.) ──
+    // Do this FIRST so the slow RPC call happens before we fetch the blockhash.
+    // Blockhash expires in ~60-90s; we don't want to burn that window here.
+    btn.textContent = '⏳ BUILDING TX…';
     var buildRes  = await fetch('/api/build-transfer', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body:   JSON.stringify({ senderWallet: wallet.toString(), livesCount: livesCount })
@@ -1919,25 +1939,14 @@ async function buyExtraLife(livesCount) {
     var buildData = await buildRes.json();
     if (!buildRes.ok || buildData.error) throw new Error('Build error: ' + buildData.error);
 
-    // ── Reconstruct TransactionInstructions from server data ──
-    function deserializeIx(raw) {
-      return new solanaWeb3.TransactionInstruction({
-        programId: new solanaWeb3.PublicKey(raw.programId),
-        keys: raw.keys.map(function(k) { return {
-          pubkey:     new solanaWeb3.PublicKey(k.pubkey),
-          isSigner:   k.isSigner,
-          isWritable: k.isWritable,
-        }; }),
-        data: new Uint8Array(raw.data),
-      });
-    }
-
-    // ── Fetch blockhash via server proxy ─────────────────
+    // ── Step 2: Fetch blockhash LAST — right before signing ──
+    // This maximises the window between fetching and Phantom confirming.
+    btn.textContent = '⏳ FETCHING BLOCKHASH…';
     var bhRes  = await fetch('/api/blockhash');
     var latest = await bhRes.json();
-    if (latest.error) throw new Error('Blockhash error: ' + latest.error);
+    if (!bhRes.ok || latest.error || !latest.blockhash) throw new Error('Blockhash error: ' + (latest.error || 'no blockhash returned'));
 
-    // ── Assemble transaction ──────────────────────────────
+    // ── Step 3: Assemble transaction ──────────────────────
     var tx = new solanaWeb3.Transaction({
       recentBlockhash:      latest.blockhash,
       lastValidBlockHeight: latest.lastValidBlockHeight,
@@ -1945,23 +1954,11 @@ async function buyExtraLife(livesCount) {
     });
     buildData.instructions.forEach(function(raw) { tx.add(deserializeIx(raw)); });
 
-    // ── Step 2: Server-side pre-flight simulation ─────────
-    // Runs simulateTransaction before wallet popup.
-    // Catches insufficient balance, missing accounts, program errors.
-    btn.textContent = '⏳ SIMULATING…';
-    var simBytes = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
-    var simRes  = await fetch('/api/simulate-tx', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body:   JSON.stringify({ tx: Array.from(simBytes) })
-    });
-    var simData = await simRes.json();
-    if (!simRes.ok || simData.error) throw new Error('Pre-flight: ' + simData.error);
-
-    // ── Step 3: Phantom signs ─────────────────────────────
-    // Because instructions were built with the official spl-token lib,
-    // Phantom decodes them as "Send 100 ZEP to <address>" — no "unsafe" warning.
+    // ── Step 4: Phantom signs — popup appears immediately ─
+    // No simulation delay before this point.
+    // Phantom runs its own preflight simulation internally.
     btn.textContent = '⏳ APPROVE IN PHANTOM…';
-    toast('🔏 Check Phantom — approve the 100 ZEP transfer', 10000);
+    toast('🔏 Check Phantom — approve the ' + totalZep + ' ZEP transfer', 12000);
 
     var signedTx = await window.solana.signTransaction(tx);
 
@@ -2003,15 +2000,15 @@ async function buyExtraLife(livesCount) {
     await fetchZepBalance();
     toast('✅ ' + livesCount + ' ' + (livesCount===1?'life':'lives') + ' added! ' + livesRemaining + ' left this hour.', 3500);
 
-    // ── Resume game ───────────────────────────────────────
-    if(rafId){ cancelAnimationFrame(rafId); rafId=null; }
-    gState = 'playing';
+    // ── Show READY screen, then resume on button press ─────
+    // (scr-ready has its own CONTINUE button; don't start loop here)
     sq.y = GY - sq.h; sq.vy = 0; sq.jumps = 0; sq.inv = 200;
     obstacles = []; acorns = []; powerups = []; particles = [];
     frozenObs = []; frozenAcorns = [];
     document.getElementById('scr-over').style.display = 'none';
+    document.getElementById('ready-lives-display').textContent = '❤ ' + lives;
+    document.getElementById('scr-ready').classList.add('show');
     updateTopUI();
-    requestAnimationFrame(loop);
 
   } catch(e) {
     console.error(e);
@@ -2021,7 +2018,7 @@ async function buyExtraLife(livesCount) {
     else
       toast('❌ ' + msg.slice(0, 72), 4500);
   } finally {
-    btn.disabled = false; btn.textContent = '💎 PAY 100 ZEP — CONTINUE';
+    btn.disabled = false; btn.textContent = '💎 BUY EXTRA LIVES';
   }
 }
 
