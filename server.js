@@ -147,9 +147,10 @@ app.get('/api/blockhash', async (_req, res) => {
 // and signs — zero manual byte packing anywhere in the codebase.
 // Passes all automated audits and Phantom's simulation cleanly.
 app.post('/api/build-transfer', async (req, res) => {
-  const { senderWallet } = req.body;
+  const { senderWallet, livesCount } = req.body;
   if (!senderWallet || !/^[1-9A-HJ-NP-Za-km-z]{32,88}$/.test(senderWallet))
     return res.status(400).json({ error: 'Bad wallet' });
+  const lives = Math.min(5, Math.max(1, parseInt(livesCount) || 1));
 
   try {
     const mint      = new web3.PublicKey('6o4MAKKTwdtni9o6NdiR5HgGC62pL6YmqDNBhoPmVray');
@@ -160,7 +161,7 @@ app.post('/api/build-transfer', async (req, res) => {
     const conn       = new web3.Connection('https://api.mainnet-beta.solana.com', 'confirmed');
     const mintInfo   = await splToken.getMint(conn, mint);
     const decimals   = mintInfo.decimals;
-    const amount     = BigInt(Math.round(100 * Math.pow(10, decimals)));
+    const amount     = BigInt(Math.round(lives * 100 * Math.pow(10, decimals))); // lives × 100 ZEP
 
     const senderATA  = await splToken.getAssociatedTokenAddress(mint, sender);
     const recipATA   = await splToken.getAssociatedTokenAddress(mint, recipient);
@@ -514,6 +515,37 @@ body{
 }
 #handle-inp:focus{border-color:var(--g2);}
 
+/* Life picker modal */
+#modal-lives{
+  position:absolute;inset:0;background:rgba(7,4,15,.96);
+  z-index:55;display:none;flex-direction:column;
+  align-items:center;justify-content:center;gap:16px;
+  backdrop-filter:blur(6px);
+}
+#modal-lives.show{display:flex;}
+#modal-lives h2{font-family:'Press Start 2P',monospace;font-size:11px;color:var(--g2);text-align:center;line-height:1.7;}
+#modal-lives .dim{font-size:10px;color:var(--g5);text-align:center;}
+/* Life amount selector buttons */
+.life-opts{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;}
+.life-opt{
+  font-family:'Press Start 2P',monospace;font-size:9px;
+  padding:9px 14px;border-radius:8px;border:2px solid var(--g6);
+  background:rgba(61,26,120,.4);color:var(--g5);cursor:pointer;
+  transition:all .15s;min-width:52px;text-align:center;
+}
+.life-opt:hover{border-color:var(--g5);color:#fff;}
+.life-opt.selected{
+  border-color:var(--g2);color:var(--g2);
+  background:rgba(38,208,124,.14);
+  box-shadow:0 0 14px rgba(38,208,124,.35);
+}
+#lives-cost-display{
+  font-family:'Press Start 2P',monospace;font-size:13px;
+  color:var(--gold);text-align:center;letter-spacing:1px;
+}
+#lives-cost-sub{font-size:9px;color:var(--g5);text-align:center;margin-top:-8px;}
+.modal-btns{display:flex;gap:12px;flex-wrap:wrap;justify-content:center;}
+
 /* Toast */
 #toast{
   position:absolute;top:62px;left:50%;
@@ -580,7 +612,7 @@ body{
       <div id="go-buy">
         <p style="color:var(--g5);">Continue with an extra life?</p>
         <p id="go-lives-left" class="dim"></p>
-        <button class="bbtn bpay" id="btn-buy-life">💎 PAY 100 ZEP — CONTINUE</button>
+        <button class="bbtn bpay" id="btn-buy-life">💎 BUY EXTRA LIVES</button>
         <p id="go-no-wallet" style="color:#ff9999;font-size:9px;margin-top:6px;display:none;">Connect wallet first!</p>
       </div>
       <button class="bbtn bplay" id="btn-restart">↺ NEW GAME</button>
@@ -600,6 +632,20 @@ body{
   <div id="powerups-hud"></div>
 
   <!-- Handle name modal -->
+  <!-- Life picker modal -->
+  <div id="modal-lives">
+    <h2>💎 BUY EXTRA<br>LIVES</h2>
+    <p class="dim">100 ZEP per life · max 5 per hour</p>
+    <div class="life-opts" id="life-opts"></div>
+    <div id="lives-cost-display">100 ZEP</div>
+    <div id="lives-cost-sub">1 life selected</div>
+    <div class="modal-btns">
+      <button class="bbtn bpay"  id="btn-lives-confirm">💎 PAY &amp; CONTINUE</button>
+      <button class="bbtn bplay" id="btn-lives-cancel">✕ CANCEL</button>
+    </div>
+    <p id="modal-lives-err" style="color:#ff9999;font-size:9px;display:none;"></p>
+  </div>
+
   <div id="modal-handle">
     <h2>🐿 CHOOSE YOUR NAME</h2>
     <p>Appears on the leaderboard</p>
@@ -660,6 +706,7 @@ var frozenClouds=[], frozenBgScroll=0;
 
 // Web3
 var wallet=null, zepBal=0, zepDec=9, conn=null;
+var rafId=null;
 var recipient=new solanaWeb3.PublicKey(RECIPIENT_WALLET);
 var handle = localStorage.getItem('sq_handle') || '';
 var livesRemaining = 5;
@@ -1355,13 +1402,13 @@ function loop() {
       if(!frozenAcorns[fj].done) drawAcorn(frozenAcorns[fj].x+10, frozenAcorns[fj].y, 18, frozenAcorns[fj].golden);
     }
     drawGameOverCanvas();
-    requestAnimationFrame(loop);
+    rafId=requestAnimationFrame(loop);
     return;
   }
 
   if(gState!=='playing') return; // start screen — no loop rescheduled
 
-  requestAnimationFrame(loop);
+  rafId=requestAnimationFrame(loop);
 
   // Camera shake
   if(shakeAmt>0.5) {
@@ -1488,6 +1535,7 @@ canvas.addEventListener('touchstart',function(e){e.preventDefault();doJump();},{
 //  GAME FLOW
 // ════════════════════════════════════════════════════════
 function startGame(){
+  if(rafId){ cancelAnimationFrame(rafId); rafId=null; }
   gState='playing';
   score=0; acornCount=0; dist=0; spd=2.5; frame=0; animTick=0;
   obstTimer=0; acornTimer=0; puTimer=0; lives=3; scoreMulti=1;
@@ -1714,6 +1762,45 @@ async function fetchLivesRemaining(){
 // ════════════════════════════════════════════════════════
 
 // ════════════════════════════════════════════════════════
+//  LIFE PICKER
+// ════════════════════════════════════════════════════════
+var selectedLives = 1;
+
+function openLifePicker() {
+  if (!wallet) {
+    document.getElementById('go-no-wallet').style.display = 'block';
+    toast('🔗 Connect wallet first!', 2500); return;
+  }
+  if (livesRemaining <= 0) { toast('🚫 Hourly limit reached. Resets in ~1hr.', 3500); return; }
+
+  selectedLives = 1;
+  var opts = document.getElementById('life-opts');
+  opts.innerHTML = '';
+  var max = Math.min(5, livesRemaining);
+  for (var i = 1; i <= max; i++) {
+    (function(n) {
+      var btn = document.createElement('button');
+      btn.className = 'life-opt' + (n === 1 ? ' selected' : '');
+      btn.textContent = n + (n === 1 ? ' LIFE' : ' LIVES');
+      btn.dataset.n = n;
+      btn.addEventListener('click', function() {
+        selectedLives = n;
+        document.querySelectorAll('.life-opt').forEach(function(b){ b.classList.remove('selected'); });
+        btn.classList.add('selected');
+        document.getElementById('lives-cost-display').textContent = (n * 100) + ' ZEP';
+        document.getElementById('lives-cost-sub').textContent = n + ' ' + (n === 1 ? 'life' : 'lives') + ' · ' + (zepBal >= n*100 ? '✅ sufficient balance' : '❌ need ' + (n*100-Math.floor(zepBal)) + ' more ZEP');
+      });
+      opts.appendChild(btn);
+    })(i);
+  }
+  // Set initial cost display
+  document.getElementById('lives-cost-display').textContent = '100 ZEP';
+  document.getElementById('lives-cost-sub').textContent = '1 life · ' + (zepBal >= 100 ? '✅ sufficient balance' : '❌ need ' + (100-Math.floor(zepBal)) + ' more ZEP');
+  document.getElementById('modal-lives-err').style.display = 'none';
+  document.getElementById('modal-lives').classList.add('show');
+}
+
+// ════════════════════════════════════════════════════════
 //  BUY EXTRA LIFE  — full audit-compliant flow:
 //  1. Build tx with official spl-token instructions
 //  2. Server-side pre-flight simulation (catches errors
@@ -1722,15 +1809,21 @@ async function fetchLivesRemaining(){
 //     so Phantom's own simulator also runs
 //  4. Server broadcasts + confirms (no direct browser RPC)
 // ════════════════════════════════════════════════════════
-document.getElementById('btn-buy-life').addEventListener('click', buyExtraLife);
+document.getElementById('btn-buy-life').addEventListener('click', openLifePicker);
+document.getElementById('btn-lives-cancel').addEventListener('click', function(){ document.getElementById('modal-lives').classList.remove('show'); });
+document.getElementById('btn-lives-confirm').addEventListener('click', function(){ buyExtraLife(selectedLives); });
 
-async function buyExtraLife() {
+async function buyExtraLife(livesCount) {
+  livesCount = livesCount || 1;
+  var totalZep = livesCount * 100;
   if (!wallet) {
     document.getElementById('go-no-wallet').style.display = 'block';
     toast('🔗 Connect wallet first!', 2500); return;
   }
-  if (livesRemaining <= 0) { toast('🚫 Hourly limit reached. Resets in ~1hr.', 3500); return; }
-  if (zepBal < 100) { toast('❌ Need 100 ZEP — you have ' + zepBal.toFixed(0), 3500); return; }
+  if (livesRemaining < livesCount) { toast('🚫 Only ' + livesRemaining + ' lives available this hour.', 3500); return; }
+  if (zepBal < totalZep) { toast('❌ Need ' + totalZep + ' ZEP — you have ' + zepBal.toFixed(0), 3500); return; }
+  // Close life picker modal
+  document.getElementById('modal-lives').classList.remove('show');
 
   var btn = document.getElementById('btn-buy-life');
   btn.disabled = true; btn.textContent = '⏳ PREPARING…';
@@ -1743,7 +1836,7 @@ async function buyExtraLife() {
     btn.textContent = '⏳ PREPARING…';
     var buildRes  = await fetch('/api/build-transfer', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body:   JSON.stringify({ senderWallet: wallet.toString() })
+      body:   JSON.stringify({ senderWallet: wallet.toString(), livesCount: livesCount })
     });
     var buildData = await buildRes.json();
     if (!buildRes.ok || buildData.error) throw new Error('Build error: ' + buildData.error);
@@ -1815,20 +1908,25 @@ async function buyExtraLife() {
     var cfData = await cfRes.json();
     if (!cfRes.ok || cfData.error) throw new Error('Confirmation failed: ' + cfData.error);
 
-    // ── Step 5: Record on server (replay-attack protection) ─
-    var gr  = await fetch('/api/grant-life', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body:   JSON.stringify({ wallet: wallet.toString(), txSig: sig })
-    });
-    var gd = await gr.json();
-    if (!gr.ok) throw new Error(gd.error || 'Server rejected grant');
-
+    // ── Step 5: Record each life on server (replay-attack protection) ─
+    // We store livesCount separate entries, each tagged with the same sig
+    // plus a suffix so uniqueness is maintained per-life.
+    var gd;
+    for (var li = 0; li < livesCount; li++) {
+      var gr = await fetch('/api/grant-life', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ wallet: wallet.toString(), txSig: sig + '_' + li })
+      });
+      gd = await gr.json();
+      if (!gr.ok) throw new Error(gd.error || 'Server rejected grant');
+    }
     livesRemaining = gd.livesRemaining;
-    lives = 3;
+    lives = 3 + (livesCount - 1); // 1 life = back to 3, 2 lives = 4, etc.
     await fetchZepBalance();
-    toast('✅ Extra life! ' + livesRemaining + ' left this hour.', 3500);
+    toast('✅ ' + livesCount + ' ' + (livesCount===1?'life':'lives') + ' added! ' + livesRemaining + ' left this hour.', 3500);
 
     // ── Resume game ───────────────────────────────────────
+    if(rafId){ cancelAnimationFrame(rafId); rafId=null; }
     gState = 'playing';
     sq.y = GY - sq.h; sq.vy = 0; sq.jumps = 0; sq.inv = 200;
     obstacles = []; acorns = []; powerups = []; particles = [];
