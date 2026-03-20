@@ -60,6 +60,42 @@ const stmts = {
 };
 
 // ─────────────────────────────────────────────────────────────
+//  RPC HELPER  — tries multiple endpoints, retries on 429/null
+// ─────────────────────────────────────────────────────────────
+const RPC_ENDPOINTS = [
+  'https://api.mainnet-beta.solana.com',
+  'https://rpc.ankr.com/solana',
+  'https://solana-mainnet.rpc.extrnode.com',
+];
+
+async function rpcCall(body, timeoutMs = 8000) {
+  let lastErr;
+  for (const url of RPC_ENDPOINTS) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        const res = await fetch(url, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify(body),
+          signal:  controller.signal,
+        });
+        clearTimeout(timer);
+        if (res.status === 429) { await new Promise(r => setTimeout(r, 600 * (attempt + 1))); continue; }
+        const data = await res.json();
+        if (data?.result !== undefined) return data;  // success
+        lastErr = new Error('Null result from ' + url);
+      } catch (e) {
+        lastErr = e;
+        if (attempt === 0) await new Promise(r => setTimeout(r, 400));
+      }
+    }
+  }
+  throw lastErr || new Error('All RPC endpoints failed');
+}
+
+// ─────────────────────────────────────────────────────────────
 //  EXPRESS
 // ─────────────────────────────────────────────────────────────
 const app = express();
@@ -119,21 +155,16 @@ app.post('/api/grant-life', (req, res) => {
 
 
 // ── GET /api/blockhash ───────────────────────────────────────
-// Proxies getLatestBlockhash to avoid browser RPC 403s
+// Proxies getLatestBlockhash — retries across fallback RPCs
 app.get('/api/blockhash', async (_req, res) => {
   try {
-    const rpcRes = await fetch('https://api.mainnet-beta.solana.com', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'getLatestBlockhash', params:[{ commitment:'confirmed' }] })
-    });
-    const data = await rpcRes.json();
+    const data = await rpcCall({ jsonrpc:'2.0', id:1, method:'getLatestBlockhash', params:[{ commitment:'confirmed' }] });
     const val  = data?.result?.value;
     if (!val) return res.status(502).json({ error: 'Bad RPC response' });
     res.json({ blockhash: val.blockhash, lastValidBlockHeight: val.lastValidBlockHeight });
   } catch(e) {
     console.warn('blockhash proxy error:', e.message);
-    res.status(502).json({ error: 'RPC error' });
+    res.status(502).json({ error: 'RPC unavailable — try again in a moment' });
   }
 });
 
@@ -142,10 +173,6 @@ app.get('/api/blockhash', async (_req, res) => {
 
 
 // ── POST /api/build-transfer ─────────────────────────────────
-// Builds the ZEP transfer instructions server-side using the official
-// @solana/spl-token npm package. Client attaches these to a Transaction
-// and signs — zero manual byte packing anywhere in the codebase.
-// Passes all automated audits and Phantom's simulation cleanly.
 app.post('/api/build-transfer', async (req, res) => {
   const { senderWallet, livesCount } = req.body;
   if (!senderWallet || !/^[1-9A-HJ-NP-Za-km-z]{32,88}$/.test(senderWallet))
@@ -157,16 +184,23 @@ app.post('/api/build-transfer', async (req, res) => {
     const sender    = new web3.PublicKey(senderWallet);
     const recipient = new web3.PublicKey('24Ti8yNf29t4E1mJdzDkEyBCrMFggrqLLFkmDbLrLZxV');
 
-    // Fetch mint decimals from chain
-    const conn       = new web3.Connection('https://api.mainnet-beta.solana.com', 'confirmed');
-    const mintInfo   = await splToken.getMint(conn, mint);
+    // Use first available RPC endpoint (with fallbacks) for getMint
+    let mintInfo, lastErr2;
+    for (const url of RPC_ENDPOINTS) {
+      try {
+        const c = new web3.Connection(url, 'confirmed');
+        mintInfo = await splToken.getMint(c, mint);
+        break;
+      } catch(e) { lastErr2 = e; }
+    }
+    if (!mintInfo) throw lastErr2 || new Error('Could not fetch mint info');
+
     const decimals   = mintInfo.decimals;
-    const amount     = BigInt(Math.round(lives * 100 * Math.pow(10, decimals))); // lives × 100 ZEP
+    const amount     = BigInt(Math.round(lives * 100 * Math.pow(10, decimals)));
 
     const senderATA  = await splToken.getAssociatedTokenAddress(mint, sender);
     const recipATA   = await splToken.getAssociatedTokenAddress(mint, recipient);
 
-    // Build instructions using official spl-token functions
     const createIx   = splToken.createAssociatedTokenAccountIdempotentInstruction(
       sender, recipATA, recipient, mint
     );
@@ -174,8 +208,6 @@ app.post('/api/build-transfer', async (req, res) => {
       senderATA, mint, recipATA, sender, amount, decimals
     );
 
-    // Serialize instructions so client can reconstruct them
-    // (TransactionInstruction is not JSON-serializable directly)
     function serializeIx(ix) {
       return {
         programId: ix.programId.toString(),
@@ -203,90 +235,78 @@ app.post('/api/build-transfer', async (req, res) => {
 
 // ── POST /api/simulate-tx ────────────────────────────────────
 // Runs simulateTransaction server-side before wallet popup.
-// Catches instruction errors, balance issues, missing accounts
-// BEFORE the user ever sees a Phantom prompt.
+// If the RPC is flaky/rate-limited we warn but don't block —
+// Phantom runs its own preflight simulation on sign anyway.
 app.post('/api/simulate-tx', async (req, res) => {
   const { tx } = req.body;
   if (!tx || !Array.isArray(tx)) return res.status(400).json({ error: 'tx array required' });
   try {
     const encoded = Buffer.from(tx).toString('base64');
-    const rpcRes = await fetch('https://api.mainnet-beta.solana.com', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0', id: 1,
-        method: 'simulateTransaction',
-        params: [encoded, {
-          encoding:            'base64',
-          commitment:          'confirmed',
-          sigVerify:           false,   // no sig yet — this is pre-sign
-          replaceRecentBlockhash: true  // use ledger tip so blockhash is always fresh
-        }]
-      })
-    });
-    const data = await rpcRes.json();
+    const data = await rpcCall({
+      jsonrpc: '2.0', id: 1,
+      method: 'simulateTransaction',
+      params: [encoded, {
+        encoding:               'base64',
+        commitment:             'confirmed',
+        sigVerify:              false,
+        replaceRecentBlockhash: true,
+      }]
+    }, 10000);
+
     const result = data?.result?.value;
-    if (!result) return res.status(502).json({ error: 'Bad RPC response' });
+    if (!result) {
+      // RPC returned something unexpected — log it but don't block the user.
+      // Phantom's own preflight will catch real instruction errors.
+      console.warn('simulate-tx: unexpected RPC shape, skipping:', JSON.stringify(data).slice(0,200));
+      return res.json({ ok: true, skipped: true });
+    }
     if (result.err) {
-      // Decode the most common errors into human-readable messages
       const errStr = JSON.stringify(result.err);
       let friendly = 'Transaction would fail: ' + errStr;
-      if (errStr.includes('InsufficientFunds'))      friendly = 'Insufficient SOL for fees';
-      if (errStr.includes('TokenAccountNotFound'))   friendly = 'Token account not found';
-      if (errStr.includes('Custom":1'))              friendly = 'Insufficient ZEP balance';
+      if (errStr.includes('InsufficientFunds'))    friendly = 'Insufficient SOL for fees';
+      if (errStr.includes('TokenAccountNotFound')) friendly = 'Token account not found';
+      if (errStr.includes('Custom":1'))            friendly = 'Insufficient ZEP balance';
       return res.status(400).json({ error: friendly, raw: result.err, logs: result.logs });
     }
     res.json({ ok: true, unitsConsumed: result.unitsConsumed, logs: result.logs });
   } catch(e) {
-    console.warn('simulate-tx error:', e.message);
-    res.status(502).json({ error: 'Simulation RPC error: ' + e.message });
+    // RPC completely unavailable — warn, but let Phantom's preflight handle it
+    console.warn('simulate-tx error (non-fatal):', e.message);
+    res.json({ ok: true, skipped: true, warn: 'Server simulation unavailable; Phantom preflight will run' });
   }
 });
 
 // ── POST /api/send-tx ────────────────────────────────────────
-// Broadcasts a signed raw transaction from the browser
 app.post('/api/send-tx', async (req, res) => {
   const { tx } = req.body;
   if (!tx || !Array.isArray(tx)) return res.status(400).json({ error: 'tx array required' });
   try {
-    const buf = Buffer.from(tx);
-    const encoded = buf.toString('base64');
-    const rpcRes = await fetch('https://api.mainnet-beta.solana.com', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0', id: 1,
-        method: 'sendTransaction',
-        params: [encoded, { encoding: 'base64', preflightCommitment: 'confirmed' }]
-      })
+    const encoded = Buffer.from(tx).toString('base64');
+    const data = await rpcCall({
+      jsonrpc: '2.0', id: 1,
+      method: 'sendTransaction',
+      params: [encoded, { encoding: 'base64', preflightCommitment: 'confirmed' }]
     });
-    const data = await rpcRes.json();
     if (data.error) return res.status(400).json({ error: data.error.message || 'RPC error' });
     res.json({ signature: data.result });
   } catch(e) {
     console.warn('send-tx error:', e.message);
-    res.status(502).json({ error: 'RPC error' });
+    res.status(502).json({ error: 'RPC error: ' + e.message });
   }
 });
 
 // ── POST /api/confirm-tx ─────────────────────────────────────
-// Proxies transaction confirmation to avoid browser RPC 403s
 app.post('/api/confirm-tx', async (req, res) => {
   const { signature } = req.body;
   if (!signature) return res.status(400).json({ error: 'signature required' });
   try {
     let attempts = 0;
     while (attempts < 30) {
-      const rpcRes = await fetch('https://api.mainnet-beta.solana.com', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0', id: 1,
-          method: 'getSignatureStatuses',
-          params: [[signature], { searchTransactionHistory: true }]
-        })
+      const data = await rpcCall({
+        jsonrpc: '2.0', id: 1,
+        method: 'getSignatureStatuses',
+        params: [[signature], { searchTransactionHistory: true }]
       });
-      const data = await rpcRes.json();
       const status = data?.result?.value?.[0];
       if (status) {
         if (status.err) return res.status(400).json({ error: 'Transaction failed on-chain', detail: status.err });
@@ -299,7 +319,7 @@ app.post('/api/confirm-tx', async (req, res) => {
     res.status(408).json({ error: 'Confirmation timeout' });
   } catch(e) {
     console.warn('confirm-tx error:', e.message);
-    res.status(502).json({ error: 'RPC error' });
+    res.status(502).json({ error: 'RPC error: ' + e.message });
   }
 });
 
@@ -318,20 +338,15 @@ app.get('/api/zep-balance/:wallet', async (req, res) => {
   if (!wallet || !/^[1-9A-HJ-NP-Za-km-z]{32,88}$/.test(wallet))
     return res.status(400).json({ error: 'Bad wallet' });
   try {
-    const rpcRes = await fetch('https://api.mainnet-beta.solana.com', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0', id: 1,
-        method: 'getTokenAccountsByOwner',
-        params: [
-          wallet,
-          { mint: '6o4MAKKTwdtni9o6NdiR5HgGC62pL6YmqDNBhoPmVray' },
-          { encoding: 'jsonParsed' }
-        ]
-      })
+    const data = await rpcCall({
+      jsonrpc: '2.0', id: 1,
+      method: 'getTokenAccountsByOwner',
+      params: [
+        wallet,
+        { mint: '6o4MAKKTwdtni9o6NdiR5HgGC62pL6YmqDNBhoPmVray' },
+        { encoding: 'jsonParsed' }
+      ]
     });
-    const data = await rpcRes.json();
     const accounts = data?.result?.value || [];
     if (accounts.length === 0) return res.json({ balance: 0, decimals: 9 });
     const info = accounts[0].account.data.parsed.info.tokenAmount;
