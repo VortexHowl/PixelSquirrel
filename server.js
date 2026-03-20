@@ -376,7 +376,7 @@ body{
   <div class="screen" id="scr-start">
     <div class="s-title">PIXEL<br>SQUIRREL</div>
     <p>Jump traps · Grab acorns · Collect power-ups</p>
-    <p class="dim">SPACE / ↑ / TAP — double jump</p>
+    <p class="dim">SPACE/↑ jump · A/← D/→ move · double jump</p>
     <p style="color:var(--gold);font-size:10px;margin-top:6px;">🌰 Extra lives: 100 ZEP each · 5 per hour</p>
     <button class="bbtn bplay" id="btn-start">▶ PLAY</button>
   </div>
@@ -456,7 +456,7 @@ var C = {
 //  GAME STATE
 // ════════════════════════════════════════════════════════
 var gState = 'start'; // start | playing | over
-var score=0, dist=0, acornCount=0, spd=5, frame=0, animTick=0;
+var score=0, dist=0, acornCount=0, spd=2.5, frame=0, animTick=0;
 var lives=3, scoreMulti=1;
 var obstTimer=0, acornTimer=0, puTimer=0;
 var shakeX=0, shakeY=0, shakeDec=0, shakeAmt=0;
@@ -475,7 +475,8 @@ var handle = localStorage.getItem('sq_handle') || '';
 var livesRemaining = 5;
 
 // Entities
-var sq = {x:110, y:0, vy:0, onGround:true, jumps:0, w:48, h:54, af:0, inv:0};
+var sq = {x:110, y:0, vy:0, vx:0, onGround:true, jumps:0, w:48, h:54, af:0, inv:0};
+var keys = {};
 var obstacles=[], acorns=[], powerups=[], particles=[], clouds=[], groundDots=[];
 var bgScroll=0;
 
@@ -900,13 +901,13 @@ function drawHUD() {
   // Speed bar
   var bW=80, bX=W/2-40;
   ctx.fillStyle='rgba(255,255,255,0.1)'; ctx.fillRect(bX,8,bW,6);
-  var pct=Math.min((spd-5)/7,1);
+  var pct=Math.min((spd-2.5)/3.75,1);
   var bg=ctx.createLinearGradient(bX,0,bX+bW,0);
   bg.addColorStop(0,C.g2); bg.addColorStop(1,C.g5);
   ctx.fillStyle=bg; ctx.fillRect(bX,8,bW*pct,6);
   ctx.fillStyle=C.g5; ctx.font='9px "Share Tech Mono"';
   ctx.textAlign='center';
-  ctx.fillText('SPD '+spd.toFixed(1), W/2, 24);
+  ctx.fillText('SPD '+spd.toFixed(1)+' / 6.25', W/2, 24);
   // Power-up timers (small bars above squirrel)
   if (puShield>0) drawPUBar(sq.x-4,sq.y-14,puShield,360,'#4DB8FF','S');
   if (puMagnet>0) drawPUBar(sq.x-4,sq.y-(puShield>0?24:14),puMagnet,480,C.gold,'M');
@@ -957,13 +958,13 @@ function drawGameOverCanvas() {
 // ════════════════════════════════════════════════════════
 //  SPAWNING
 // ════════════════════════════════════════════════════════
-function obstInterval() { return Math.max(38, 110-(spd-5)*9); }
+function obstInterval() { return Math.max(45, 130-(spd-2.5)*18); }
 function acornInterval() { return 48; }
 function puInterval()   { return 380; }
 
 function spawnObstacle() {
-  var pool = spd<6.5 ? ['spike','log','log','thorn'] :
-             spd<8   ? ['spike','log','rock','stump','thorn','snake'] :
+  var pool = spd<3.5 ? ['spike','log','log','thorn'] :
+             spd<5   ? ['spike','log','rock','stump','thorn','snake'] :
                        ['spike','log','rock','stump','thorn','snake','snake','spike'];
   var type = pool[Math.floor(Math.random()*pool.length)];
   var w,h;
@@ -1071,12 +1072,16 @@ function loop() {
 
   frame++;
   dist+=spd*0.05;
-  spd=Math.min(5+dist/550,12.5);
+  spd=Math.min(2.5+dist/1800,6.25);
   scoreMulti = puDouble>0 ? 2 : 1;
 
   // Squirrel physics
-  sq.vy+=0.6; sq.y+=sq.vy;
+  sq.vy+=0.28; sq.y+=sq.vy;
   if(sq.y>=GY-sq.h){ sq.y=GY-sq.h; sq.vy=0; sq.onGround=true; sq.jumps=0; } else sq.onGround=false;
+  sq.vx = keys["ArrowLeft"]||keys["KeyA"] ? -4 : keys["ArrowRight"]||keys["KeyD"] ? 4 : 0;
+  sq.x += sq.vx;
+  if(sq.x < 20) sq.x = 20;
+  if(sq.x > W*0.55) sq.x = W*0.55;
   if(sq.inv>0) sq.inv--;
 
   // Animate
@@ -1164,11 +1169,14 @@ function updatePUHud(){
 // ════════════════════════════════════════════════════════
 function doJump(){
   if(gState!=='playing') return;
-  if(sq.jumps<2){ sq.vy=-13.5; sq.jumps++; spawnParticles(sq.x+sq.w/2,sq.y+sq.h,C.g2,7); }
+  if(sq.jumps<2){ sq.vy=-17; sq.jumps++; spawnParticles(sq.x+sq.w/2,sq.y+sq.h,C.g2,7); }
 }
 document.addEventListener('keydown',function(e){
+  keys[e.code]=true;
   if(['Space','ArrowUp','KeyW'].includes(e.code)){ e.preventDefault(); doJump(); }
+  if(['ArrowLeft','ArrowRight','KeyA','KeyD'].includes(e.code)) e.preventDefault();
 });
+document.addEventListener('keyup',function(e){ keys[e.code]=false; });
 canvas.addEventListener('click',doJump);
 canvas.addEventListener('touchstart',function(e){e.preventDefault();doJump();},{passive:false});
 
@@ -1177,13 +1185,13 @@ canvas.addEventListener('touchstart',function(e){e.preventDefault();doJump();},{
 // ════════════════════════════════════════════════════════
 function startGame(){
   gState='playing';
-  score=0; acornCount=0; dist=0; spd=5; frame=0; animTick=0;
+  score=0; acornCount=0; dist=0; spd=2.5; frame=0; animTick=0;
   obstTimer=0; acornTimer=0; puTimer=0; lives=3; scoreMulti=1;
   puShield=0; puMagnet=0; puDouble=0;
   shakeAmt=0; shakeX=0; shakeY=0;
   obstacles=[]; acorns=[]; powerups=[]; particles=[];
   frozenObs=[]; frozenAcorns=[]; frozenPUs=[];
-  sq.y=GY-sq.h; sq.vy=0; sq.onGround=true; sq.jumps=0; sq.af=0; sq.inv=0;
+  sq.y=GY-sq.h; sq.vy=0; sq.vx=0; sq.onGround=true; sq.jumps=0; sq.af=0; sq.inv=0; keys={};
   spawnClouds();
   document.getElementById('scr-start').style.display='none';
   document.getElementById('scr-over').style.display='none';
