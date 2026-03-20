@@ -124,6 +124,36 @@ app.get('/api/lives-remaining', (req, res) => {
   res.json({ livesRemaining: Math.max(0, MAX_LIVES_HR - n) });
 });
 
+// ── GET /api/zep-balance/:wallet ─────────────────────────────
+app.get('/api/zep-balance/:wallet', async (req, res) => {
+  const { wallet } = req.params;
+  if (!wallet || !/^[1-9A-HJ-NP-Za-km-z]{32,88}$/.test(wallet))
+    return res.status(400).json({ error: 'Bad wallet' });
+  try {
+    const rpcRes = await fetch('https://api.mainnet-beta.solana.com', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1,
+        method: 'getTokenAccountsByOwner',
+        params: [
+          wallet,
+          { mint: '6o4MAKKTwdtni9o6NdiR5HgGC62pL6YmqDNBhoPmVray' },
+          { encoding: 'jsonParsed' }
+        ]
+      })
+    });
+    const data = await rpcRes.json();
+    const accounts = data?.result?.value || [];
+    if (accounts.length === 0) return res.json({ balance: 0, decimals: 9 });
+    const info = accounts[0].account.data.parsed.info.tokenAmount;
+    res.json({ balance: parseFloat(info.uiAmount || 0), decimals: info.decimals });
+  } catch (e) {
+    console.warn('ZEP balance proxy error:', e.message);
+    res.status(502).json({ error: 'RPC error' });
+  }
+});
+
 // ── GET * → serve the game ───────────────────────────────────
 app.get('*', (_, res) => res.type('html').send(gameHTML()));
 
@@ -1332,19 +1362,20 @@ if(window.solana){
   }).catch(function(){});
 }
 
-// ── ZEP Balance ──────────────────────────────────────────
 async function fetchZepBalance(){
-  if(!wallet||!conn) return;
+  if(!wallet) return;
+  var el=document.getElementById('p-zep');
+  el.textContent='🌰 ZEP: …';
   try {
-    var mintPk=new solanaWeb3.PublicKey(ZEP_MINT);
-    var accts=await conn.getParsedTokenAccountsByOwner(wallet,{mint:mintPk});
-    if(accts.value.length>0){
-      var info=accts.value[0].account.data.parsed.info;
-      zepDec=info.tokenAmount.decimals;
-      zepBal=parseFloat(info.tokenAmount.uiAmount||0);
-    } else { zepBal=0; zepDec=9; }
-    document.getElementById('p-zep').textContent='🌰 ZEP: '+zepBal.toLocaleString(undefined,{maximumFractionDigits:0});
-  } catch(e){ console.warn('ZEP balance',e); }
+    var r=await fetch('/api/zep-balance/'+wallet.toString());
+    var d=await r.json();
+    if(d.error){ el.textContent='🌰 ZEP: —'; return; }
+    zepBal=d.balance; zepDec=d.decimals;
+    el.textContent='🌰 ZEP: '+zepBal.toLocaleString(undefined,{maximumFractionDigits:0});
+  } catch(e){
+    el.textContent='🌰 ZEP: —';
+    console.warn('ZEP balance',e);
+  }
 }
 
 async function fetchLivesRemaining(){
