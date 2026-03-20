@@ -135,6 +135,68 @@ app.get('/api/blockhash', async (_req, res) => {
   }
 });
 
+
+
+// ── POST /api/send-tx ────────────────────────────────────────
+// Broadcasts a signed raw transaction from the browser
+app.post('/api/send-tx', async (req, res) => {
+  const { tx } = req.body;
+  if (!tx || !Array.isArray(tx)) return res.status(400).json({ error: 'tx array required' });
+  try {
+    const buf = Buffer.from(tx);
+    const encoded = buf.toString('base64');
+    const rpcRes = await fetch('https://api.mainnet-beta.solana.com', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1,
+        method: 'sendTransaction',
+        params: [encoded, { encoding: 'base64', preflightCommitment: 'confirmed' }]
+      })
+    });
+    const data = await rpcRes.json();
+    if (data.error) return res.status(400).json({ error: data.error.message || 'RPC error' });
+    res.json({ signature: data.result });
+  } catch(e) {
+    console.warn('send-tx error:', e.message);
+    res.status(502).json({ error: 'RPC error' });
+  }
+});
+
+// ── POST /api/confirm-tx ─────────────────────────────────────
+// Proxies transaction confirmation to avoid browser RPC 403s
+app.post('/api/confirm-tx', async (req, res) => {
+  const { signature } = req.body;
+  if (!signature) return res.status(400).json({ error: 'signature required' });
+  try {
+    let attempts = 0;
+    while (attempts < 30) {
+      const rpcRes = await fetch('https://api.mainnet-beta.solana.com', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1,
+          method: 'getSignatureStatuses',
+          params: [[signature], { searchTransactionHistory: true }]
+        })
+      });
+      const data = await rpcRes.json();
+      const status = data?.result?.value?.[0];
+      if (status) {
+        if (status.err) return res.status(400).json({ error: 'Transaction failed on-chain', detail: status.err });
+        if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized')
+          return res.json({ confirmed: true, slot: status.slot });
+      }
+      await new Promise(r => setTimeout(r, 2000));
+      attempts++;
+    }
+    res.status(408).json({ error: 'Confirmation timeout' });
+  } catch(e) {
+    console.warn('confirm-tx error:', e.message);
+    res.status(502).json({ error: 'RPC error' });
+  }
+});
+
 // ── GET /api/lives-remaining?wallet=xxx ──────────────────────
 app.get('/api/lives-remaining', (req, res) => {
   const { wallet } = req.query;
@@ -1621,11 +1683,24 @@ async function buyExtraLife(){
     tx.feePayer=wallet;
 
     toast('🔏 Approve in Phantom…',9000);
-    var signed=await window.solana.signAndSendTransaction(tx);
-    var sig=signed.signature;
+    // Use signTransaction so Phantom can simulate before sending
+    var signedTx=await window.solana.signTransaction(tx);
+    var rawTx=signedTx.serialize();
+    var sendRes=await fetch('/api/send-tx',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({tx: Array.from(rawTx)})
+    });
+    var sendData=await sendRes.json();
+    if(!sendRes.ok||sendData.error) throw new Error('Send failed: '+(sendData.error||'unknown'));
+    var sig=sendData.signature;
 
     toast('⏳ Confirming on-chain…',9000);
-    await conn.confirmTransaction({signature:sig,blockhash:latest.blockhash,lastValidBlockHeight:latest.lastValidBlockHeight},'confirmed');
+    var cfRes=await fetch('/api/confirm-tx',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({signature:sig})
+    });
+    var cfData=await cfRes.json();
+    if(!cfRes.ok||cfData.error) throw new Error('Confirmation failed: '+(cfData.error||'unknown'));
 
     // Tell server — replay-protected
     var gr=await fetch('/api/grant-life',{
