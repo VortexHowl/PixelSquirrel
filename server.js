@@ -294,6 +294,7 @@ body{
   border:1.5px solid;font-family:'Share Tech Mono',monospace;white-space:nowrap;
   transition:all .2s;
 }
+#p-level{color:#fff;border-color:var(--g5);background:rgba(77,96,164,.22);font-family:'Press Start 2P',monospace;font-size:8px;letter-spacing:1px;transition:color .4s,border-color .4s;}
 #p-score{color:var(--g3);border-color:var(--g1);background:rgba(7,141,112,.15);}
 #p-lives{color:var(--red);border-color:var(--red);background:rgba(255,68,112,.12);font-weight:700;}
 #p-multi{color:#FF88FF;border-color:#CC44CC;background:rgba(200,68,200,.1);display:none;}
@@ -439,6 +440,7 @@ body{
 
 <div id="bar">
   <div id="title">🐿 PIXEL SQUIRREL</div>
+  <div class="pill" id="p-level">LV 1</div>
   <div class="pill" id="p-score">SCORE: 0</div>
   <div class="pill" id="p-lives">❤ 3</div>
   <div class="pill" id="p-multi">2x COMBO!</div>
@@ -515,7 +517,7 @@ var ZEP_MINT   = '6o4MAKKTwdtni9o6NdiR5HgGC62pL6YmqDNBhoPmVray';
 var RPC_URL    = 'https://api.mainnet-beta.solana.com';
 var TOK_PROG   = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 var ATA_PROG   = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1brs';
-var SNS_URL    = 'https://sns-sdk-proxy.bonfida.workers.dev/resolve/vortexhowl';
+var RECIPIENT_WALLET = '24Ti8yNf29t4E1mJdzDkEyBCrMFggrqLLFkmDbLrLZxV';
 
 // Gay Men's Flag palette + game colours
 var C = {
@@ -552,7 +554,8 @@ var frozenObs=[], frozenAcorns=[], frozenPUs=[];
 var frozenClouds=[], frozenBgScroll=0;
 
 // Web3
-var wallet=null, zepBal=0, zepDec=9, recipient=null, conn=null;
+var wallet=null, zepBal=0, zepDec=9, conn=null;
+var recipient=new solanaWeb3.PublicKey(RECIPIENT_WALLET);
 var handle = localStorage.getItem('sq_handle') || '';
 var livesRemaining = 5;
 
@@ -1101,7 +1104,8 @@ function drawHUD() {
   ctx.fillStyle=bg; ctx.fillRect(bX,8,bW*pct,6);
   ctx.fillStyle=C.g5; ctx.font='9px "Share Tech Mono"';
   ctx.textAlign='center';
-  ctx.fillText('SPD '+spd.toFixed(1)+' / 6.25', W/2, 24);
+  var lvl=Math.min(10,Math.floor((spd-2.5)/0.375)+1);
+  ctx.fillText('LEVEL '+lvl, W/2, 24);
   // Power-up timers (small bars above squirrel)
   if (puShield>0) drawPUBar(sq.x-4,sq.y-14,puShield,360,'#4DB8FF','S');
   if (puMagnet>0) drawPUBar(sq.x-4,sq.y-(puShield>0?24:14),puMagnet,480,C.gold,'M');
@@ -1438,6 +1442,13 @@ document.getElementById('handle-inp').addEventListener('keydown',function(e){
 //  TOP BAR UI
 // ════════════════════════════════════════════════════════
 function updateTopUI(){
+  var lvl=Math.min(10,Math.floor((spd-2.5)/0.375)+1);
+  var lvlEl=document.getElementById('p-level');
+  lvlEl.textContent='LV '+lvl;
+  // Colour shifts warm as level climbs: teal→blue→purple→gold
+  var lvlCols=['#7BADE2','#7BADE2','#7BADE2','#98E8C1','#26D07C','#FFD700','#FFA040','#FF7060','#FF4470','#FF2255'];
+  lvlEl.style.color=lvlCols[lvl-1]||'#fff';
+  lvlEl.style.borderColor=lvlCols[lvl-1]||'#fff';
   document.getElementById('p-score').textContent='SCORE: '+score;
   document.getElementById('p-lives').textContent='❤ '+Math.max(lives,0);
 }
@@ -1542,7 +1553,6 @@ function onWalletConnected(pk){
   document.getElementById('p-zep').style.display='block';
   fetchZepBalance();
   fetchLivesRemaining();
-  resolveRecipient();
   toast('✅ Wallet connected!',2000);
   // Prompt for handle if not set
   if(!handle) showHandleModal(function(){});
@@ -1590,15 +1600,7 @@ async function fetchLivesRemaining(){
   } catch(e){}
 }
 
-// ── Recipient resolution (vortexhowl.sol) ───────────────
-async function resolveRecipient(){
-  if(recipient) return;
-  try {
-    var r=await fetch(SNS_URL);
-    var d=await r.json();
-    if(d&&d.result) recipient=new solanaWeb3.PublicKey(d.result);
-  } catch(e){ console.warn('SNS resolve',e); }
-}
+// recipient is pre-set to RECIPIENT_WALLET
 
 // ════════════════════════════════════════════════════════
 //  SPL TOKEN HELPERS (no extra lib needed)
@@ -1655,11 +1657,7 @@ async function buyExtraLife(){
   }
   if(livesRemaining<=0){ toast('🚫 5-life hourly limit reached. Resets in ~1hr.',3500); return; }
   if(zepBal<100){ toast('❌ Need 100 ZEP. You have '+zepBal.toFixed(0),3500); return; }
-  if(!recipient){
-    toast('🔄 Resolving vortexhowl.sol…',2000);
-    await resolveRecipient();
-    if(!recipient){ toast('❌ Could not resolve vortexhowl.sol',3500); return; }
-  }
+  // recipient is hardcoded — no resolution needed
 
   var btn=document.getElementById('btn-buy-life');
   btn.disabled=true; btn.textContent='⏳ SENDING…';
