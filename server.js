@@ -429,7 +429,7 @@ var gState = 'start'; // start | playing | over
 var score=0, dist=0, acornCount=0, spd=5, frame=0, animTick=0;
 var lives=3, scoreMulti=1;
 var obstTimer=0, acornTimer=0, puTimer=0;
-var shakeX=0, shakeY=0, shakeDec=0;
+var shakeX=0, shakeY=0, shakeDec=0, shakeAmt=0;
 var goFlicker=0;
 
 // Power-up active timers (frames remaining)
