@@ -1436,7 +1436,7 @@ function makeCreateATA(payer,ata,owner,mint){
       {pubkey:new solanaWeb3.PublicKey(TOK_PROG),isSigner:false,isWritable:false},
     ],
     programId:new solanaWeb3.PublicKey(ATA_PROG),
-    data:new Uint8Array(0)
+    data:new Uint8Array([1]) // 1 = CreateIdempotent
   });
 }
 
@@ -1468,8 +1468,9 @@ async function buyExtraLife(){
     var recipATA =await getATA(recipient,mintPk);
 
     var tx=new solanaWeb3.Transaction();
-    var recipInfo=await conn.getAccountInfo(recipATA);
-    if(!recipInfo) tx.add(makeCreateATA(wallet,recipATA,recipient,mintPk));
+    // Always include idempotent createATA — safe no-op if account already exists,
+    // avoids needing a getAccountInfo RPC call from the browser (CORS-prone)
+    tx.add(makeCreateATA(wallet,recipATA,recipient,mintPk));
     tx.add(makeTransferChecked(senderATA,mintPk,recipATA,wallet,amount,zepDec));
 
     var latest=await conn.getLatestBlockhash();
