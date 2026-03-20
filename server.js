@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /*
  ╔═══════════════════════════════════════════════════════════╗
- ║  PIXEL SQUIRREL  v2.0  —  ZEP Runner                    ║
+ ║  PIXEL SQUIRREL  v3.0  —  ZEP Runner                    ║
  ║  Single-file Node.js + SQLite + Solana Web3 Game         ║
  ╠═══════════════════════════════════════════════════════════╣
  ║  SETUP:                                                   ║
@@ -497,6 +497,26 @@ body{
   backdrop-filter:blur(12px);
 }
 
+/* Ready screen (shown after life purchase) */
+#scr-ready{
+  position:absolute;inset:0;display:none;flex-direction:column;
+  align-items:center;justify-content:center;z-index:18;
+  background:rgba(7,4,15,.92);backdrop-filter:blur(6px);
+}
+#scr-ready.show{display:flex;}
+.ready-title{
+  font-family:'Press Start 2P',monospace;
+  font-size:clamp(28px,6vw,58px);text-align:center;
+  margin-bottom:10px;letter-spacing:3px;
+  background:linear-gradient(135deg,var(--g2) 0%,var(--g5) 45%,var(--g4) 100%);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+  filter:drop-shadow(0 0 28px var(--g5));
+  animation:readyPulse 1.4s ease-in-out infinite;
+}
+@keyframes readyPulse{0%,100%{filter:drop-shadow(0 0 18px var(--g5));}50%{filter:drop-shadow(0 0 44px var(--g2));}}
+.ready-sub{font-size:11px;color:var(--g3);margin-bottom:4px;text-align:center;}
+.ready-lives{font-family:'Press Start 2P',monospace;font-size:12px;color:#FF8FAB;margin-bottom:14px;}
+
 /* Handle modal */
 #modal-handle{
   position:absolute;inset:0;background:rgba(7,4,15,.97);
@@ -576,7 +596,7 @@ body{
 <div class="flag"></div>
 
 <div id="bar">
-  <div id="title">🐿 PIXEL SQUIRREL</div>
+  <div id="title">🐿 PIXEL SQUIRREL <span style="font-size:7px;opacity:0.5;letter-spacing:0">v3.0</span></div>
   <div class="pill" id="p-level">LV 1</div>
   <div class="pill" id="p-score">SCORE: 0</div>
   <div class="pill" id="p-lives">❤ 3</div>
@@ -619,6 +639,14 @@ body{
     </div>
   </div>
 
+  <!-- READY screen (after life purchase) -->
+  <div id="scr-ready">
+    <div class="ready-title">READY?</div>
+    <p class="ready-sub">Lives restored — good luck!</p>
+    <p class="ready-lives" id="ready-lives-display">❤ 3</p>
+    <button class="bbtn bplay" id="btn-continue">▶ CONTINUE</button>
+  </div>
+
   <!-- Leaderboard panel -->
   <div id="lb-panel">
     <div id="lb-head">
@@ -658,6 +686,35 @@ body{
 
 <!-- Solana web3.js (browser IIFE bundle) -->
 <script src="https://cdn.jsdelivr.net/npm/@solana/web3.js@1.87.6/lib/index.iife.min.js"><\/script>
+<!-- Buffer polyfill: solana/web3.js ships Buffer internally; expose it globally -->
+<script>
+if (typeof Buffer === 'undefined') {
+  // Minimal Buffer shim for browser — only needs from() and toString('base64')
+  window.Buffer = {
+    from: function(data, enc) {
+      if (Array.isArray(data) || data instanceof Uint8Array) return new Uint8Array(data);
+      if (typeof data === 'string') {
+        if (enc === 'base64') {
+          var bin = atob(data), bytes = new Uint8Array(bin.length);
+          for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          return bytes;
+        }
+        var te = new TextEncoder();
+        return te.encode(data);
+      }
+      return new Uint8Array(data);
+    },
+    isBuffer: function() { return false; }
+  };
+  // Patch Uint8Array so .toString('base64') works on serialized txs
+  var _origSerialize = Uint8Array.prototype.toString;
+  Uint8Array.prototype.toBase64 = function() {
+    var bin = '';
+    for (var i = 0; i < this.length; i++) bin += String.fromCharCode(this[i]);
+    return btoa(bin);
+  };
+}
+<\/script>
 
 <script>
 'use strict';
@@ -1569,6 +1626,12 @@ document.getElementById('btn-start').addEventListener('click',function(){
   startGame();
 });
 document.getElementById('btn-restart').addEventListener('click',startGame);
+document.getElementById('btn-continue').addEventListener('click', function(){
+  document.getElementById('scr-ready').classList.remove('show');
+  gState = 'playing';
+  if(rafId){ cancelAnimationFrame(rafId); rafId=null; }
+  rafId = requestAnimationFrame(loop);
+});
 
 // ════════════════════════════════════════════════════════
 //  HANDLE MODAL
@@ -1850,7 +1913,7 @@ async function buyExtraLife(livesCount) {
           isSigner:   k.isSigner,
           isWritable: k.isWritable,
         }; }),
-        data: Buffer.from(raw.data),
+        data: new Uint8Array(raw.data),
       });
     }
 
@@ -1871,10 +1934,10 @@ async function buyExtraLife(livesCount) {
     // Runs simulateTransaction before wallet popup.
     // Catches insufficient balance, missing accounts, program errors.
     btn.textContent = '⏳ SIMULATING…';
-    var simRaw  = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
+    var simBytes = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
     var simRes  = await fetch('/api/simulate-tx', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body:   JSON.stringify({ tx: Array.from(simRaw) })
+      body:   JSON.stringify({ tx: Array.from(simBytes) })
     });
     var simData = await simRes.json();
     if (!simRes.ok || simData.error) throw new Error('Pre-flight: ' + simData.error);
@@ -1889,10 +1952,10 @@ async function buyExtraLife(livesCount) {
 
     // ── Step 3: Server broadcasts ─────────────────────────
     btn.textContent = '⏳ SENDING…';
-    var rawBytes = signedTx.serialize();
+    var sendBytes = signedTx.serialize();
     var sendRes  = await fetch('/api/send-tx', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body:   JSON.stringify({ tx: Array.from(rawBytes) })
+      body:   JSON.stringify({ tx: Array.from(sendBytes) })
     });
     var sendData = await sendRes.json();
     if (!sendRes.ok || sendData.error) throw new Error('Broadcast failed: ' + sendData.error);
