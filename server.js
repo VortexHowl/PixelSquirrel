@@ -115,6 +115,26 @@ app.post('/api/grant-life', (req, res) => {
   res.json({ ok: true, livesRemaining: MAX_LIVES_HR - n - 1 });
 });
 
+
+// ── GET /api/blockhash ───────────────────────────────────────
+// Proxies getLatestBlockhash to avoid browser RPC 403s
+app.get('/api/blockhash', async (_req, res) => {
+  try {
+    const rpcRes = await fetch('https://api.mainnet-beta.solana.com', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'getLatestBlockhash', params:[{ commitment:'confirmed' }] })
+    });
+    const data = await rpcRes.json();
+    const val  = data?.result?.value;
+    if (!val) return res.status(502).json({ error: 'Bad RPC response' });
+    res.json({ blockhash: val.blockhash, lastValidBlockHeight: val.lastValidBlockHeight });
+  } catch(e) {
+    console.warn('blockhash proxy error:', e.message);
+    res.status(502).json({ error: 'RPC error' });
+  }
+});
+
 // ── GET /api/lives-remaining?wallet=xxx ──────────────────────
 app.get('/api/lives-remaining', (req, res) => {
   const { wallet } = req.query;
@@ -502,101 +522,213 @@ window.addEventListener('resize', resize);
 //  2-D pixel grid: numbers map to palette below
 //  16 cols × 14 body rows, rendered at px=3 per pixel
 // ════════════════════════════════════════════════════════
-var SQ_PAL = [
-  null,        // 0 transparent
-  C.sqDk,      // 1 very dark brown
-  C.sqMd,      // 2 dark brown
-  C.sqLt,      // 3 medium brown
-  C.sqCr,      // 4 cream
-  C.sqBk,      // 5 black (eyes)
-  C.sqPk,      // 6 pink (nose/ears)
-  C.sqGr,      // 7 teal (collar)
-  C.sqTD,      // 8 tail outer
-  C.sqTL,      // 9 tail highlight
-];
+// ════════════════════════════════════════════════════════
+//  SQUIRREL — smooth procedural renderer, 6-frame cycle
+//  States: run(6 frames), jump, fall, left-facing, dead
+// ════════════════════════════════════════════════════════
+var SQ_W=48, SQ_H=54;
 
-// Each row is 16 columns (0 = transparent)
-var SQ_BODY = [
-  [0,2,0,0,2,0,0,0,0,0,0,0,0,0,0,0], // 0  ear tips
-  [2,3,2,0,2,3,2,0,0,0,0,0,0,0,0,0], // 1  ears
-  [2,6,6,2,2,6,6,2,0,0,0,0,0,0,0,0], // 2  inner ear pink
-  [1,2,2,2,2,2,2,1,0,0,0,0,0,0,0,8], // 3  head + tail tip
-  [2,5,3,3,3,3,5,2,0,0,0,0,0,0,8,9], // 4  eyes + tail
-  [2,3,3,3,3,3,3,2,0,0,0,0,0,8,9,9], // 5  face + tail
-  [2,3,6,3,3,6,3,2,0,0,0,0,8,9,9,8], // 6  nose + tail
-  [1,2,2,2,2,2,2,1,0,0,0,8,9,9,8,0], // 7  chin + tail
-  [0,7,7,7,7,7,7,0,0,0,8,9,9,8,0,0], // 8  collar (pride green) + tail
-  [0,2,3,4,4,3,2,0,0,8,9,9,8,0,0,0], // 9  body/belly + tail
-  [0,2,4,4,4,4,2,0,8,9,9,8,0,0,0,0], // 10 belly + tail
-  [0,2,4,4,4,4,2,0,8,9,8,0,0,0,0,0], // 11 belly lower
-  [0,1,2,2,2,2,1,0,8,8,0,0,0,0,0,0], // 12 body
-  [0,0,2,2,2,2,0,0,0,0,0,0,0,0,0,0], // 13 body bottom
-];
-var SQ_PX = 3; // pixels per sprite cell
-
-// Leg positions [frontCol, backCol] for 4 animation frames
-// Each frame is drawn as two 2×4px rectangles at row 14
-var LEG_FRAMES = [
-  {f:[2,14], b:[5,13]}, // frame 0: symmetric
-  {f:[2,13], b:[5,15]}, // frame 1: stride fwd
-  {f:[2,14], b:[5,14]}, // frame 2: mid
-  {f:[2,15], b:[5,13]}, // frame 3: stride back
+// 6 run frames: [frontThigh, frontShin, backThigh, backShin, yLift, tailAngle, bodyTilt]
+var RUN_FRAMES = [
+  [-0.30,  0.50,  0.28, -0.42,  0,   0.30,  0.02],  // 0 neutral
+  [-0.68,  0.90,  0.62, -0.80, -3,   0.50,  0.07],  // 1 stride peak
+  [-0.95,  1.20,  0.85, -1.10, -5,   0.60,  0.09],  // 2 max extension
+  [-0.50,  1.25,  0.45, -1.15, -4,   0.48,  0.06],  // 3 float/cross
+  [ 0.35,  0.55, -0.30,  0.48, -2,   0.28,  0.02],  // 4 reverse stride
+  [ 0.58,  0.22, -0.52,  0.18, -1,   0.30,  0.03],  // 5 recover
 ];
 
 function drawSquirrel(ox, oy, af, inv, dead) {
   ctx.save();
   if (inv > 0 && Math.floor(inv/5)%2===1) ctx.globalAlpha = 0.28;
+
+  var facing = (sq.vx < -0.5) ? -1 : 1;
+  var inAir  = sq.y < GY - sq.h - 3;
+  var rising = sq.vy < -1;
+  var tWave  = Math.sin(frame*0.12)*0.07;
+  var fT, fS, bT, bS, yL, tA, tilt;
+
   if (dead) {
-    ctx.translate(ox + sq.w/2, oy + sq.h/2);
+    ctx.translate(ox + SQ_W/2, oy + SQ_H/2);
     ctx.rotate(Math.PI/2);
-    ctx.translate(-sq.w/2, -sq.h/2);
-    ox = 0; oy = 0;
+    ctx.translate(-SQ_W/2, -SQ_H/2);
+    _sqDraw(0, 0, -0.3, 0.3, 0.3, 0.0, 0.5, -0.5, 0);
+    ctx.restore();
+    return;
   }
-  // Shield glow ring
-  if (puShield > 0 && !dead) {
+
+  if (inAir && rising) {
+    // Jump: legs tucked forward-up, tail swept back-up
+    fT=-0.90; fS=1.30; bT=0.80; bS=-1.20; yL=-5; tA=0.78+tWave; tilt=0.13;
+  } else if (inAir) {
+    // Fall: legs spread down, tail drooped forward
+    fT=0.30; fS=0.60; bT=-0.20; bS=0.40; yL=1; tA=0.18+tWave; tilt=-0.05;
+  } else {
+    var fd = RUN_FRAMES[af % 6];
+    fT=fd[0]; fS=fd[1]; bT=fd[2]; bS=fd[3]; yL=fd[4]; tA=fd[5]+tWave; tilt=fd[6];
+  }
+
+  if (facing < 0) {
+    // Mirror horizontally for left-facing
     ctx.save();
-    ctx.globalAlpha = 0.5 + 0.4*Math.sin(frame*0.15);
-    ctx.strokeStyle = '#4DB8FF';
-    ctx.lineWidth = 4;
-    ctx.shadowColor = '#4DB8FF';
-    ctx.shadowBlur = 16;
-    ctx.beginPath();
-    ctx.ellipse(ox + sq.w/2, oy + sq.h/2, sq.w*0.7, sq.h*0.6, 0, 0, Math.PI*2);
-    ctx.stroke();
+    ctx.translate(ox + SQ_W, oy);
+    ctx.scale(-1, 1);
+    _sqDraw(0, 0, fT, bT, tA, tilt, fS, bS, yL);
+    ctx.restore();
+  } else {
+    _sqDraw(ox, oy, fT, bT, tA, tilt, fS, bS, yL);
+  }
+
+  // Power-up fx rings drawn at real screen pos (unmirrored)
+  if (puShield > 0) {
+    ctx.save();
+    ctx.globalAlpha = 0.38 + 0.22*Math.sin(frame*0.15);
+    ctx.strokeStyle='#4DB8FF'; ctx.lineWidth=4;
+    ctx.shadowColor='#4DB8FF'; ctx.shadowBlur=18;
+    ctx.beginPath(); ctx.ellipse(ox+24,oy+28,32,38,0,0,Math.PI*2); ctx.stroke();
     ctx.restore();
   }
-  // Magnet glow
-  if (puMagnet > 0 && !dead) {
+  if (puMagnet > 0) {
     ctx.save();
-    ctx.globalAlpha = 0.3 + 0.2*Math.sin(frame*0.1);
-    ctx.fillStyle = C.gold;
-    ctx.shadowColor = C.gold;
-    ctx.shadowBlur = 20;
-    ctx.beginPath();
-    ctx.ellipse(ox + sq.w/2, oy + sq.h/2, sq.w*0.85, sq.h*0.75, 0, 0, Math.PI*2);
-    ctx.fill();
+    ctx.globalAlpha = 0.14+0.08*Math.sin(frame*0.1);
+    ctx.fillStyle=C.gold; ctx.shadowColor=C.gold; ctx.shadowBlur=24;
+    ctx.beginPath(); ctx.ellipse(ox+24,oy+28,38,44,0,0,Math.PI*2); ctx.fill();
     ctx.restore();
   }
-  // Body pixel grid
-  for (var r=0; r<SQ_BODY.length; r++) {
-    for (var cl=0; cl<SQ_BODY[r].length; cl++) {
-      var v = SQ_BODY[r][cl];
-      if (!v) continue;
-      ctx.fillStyle = SQ_PAL[v];
-      ctx.fillRect(ox + cl*SQ_PX, oy + r*SQ_PX, SQ_PX, SQ_PX);
-    }
-  }
-  // Animated legs
-  var lf = LEG_FRAMES[af % 4];
-  ctx.fillStyle = C.sqMd;
-  ctx.fillRect(ox + lf.f[0]*SQ_PX, oy + lf.f[1]*SQ_PX, 2*SQ_PX, 4*SQ_PX);
-  ctx.fillRect(ox + lf.b[0]*SQ_PX, oy + lf.b[1]*SQ_PX, 2*SQ_PX, 4*SQ_PX);
-  // Feet
-  ctx.fillStyle = C.sqDk;
-  ctx.fillRect(ox + (lf.f[0]-0.5)*SQ_PX, oy + (lf.f[1]+4)*SQ_PX, 3*SQ_PX, SQ_PX);
-  ctx.fillRect(ox + (lf.b[0]-0.5)*SQ_PX, oy + (lf.b[1]+4)*SQ_PX, 3*SQ_PX, SQ_PX);
   ctx.restore();
 }
+
+// ── Core squirrel body renderer ────────────────────────
+function _sqDraw(ox, oy, fThigh, bThigh, tailAng, tilt, fShin, bShin, yLift) {
+  fShin  = (fShin  !== undefined) ? fShin  :  0.50;
+  bShin  = (bShin  !== undefined) ? bShin  : -0.50;
+  yLift  = (yLift  !== undefined) ? yLift  :  0;
+
+  var bCX=ox+22, bCY=oy+33+yLift; // body centre
+  var hCX=ox+17, hCY=oy+13+yLift; // head centre
+
+  // ── TAIL ──────────────────────────────────────────────
+  var tbX=bCX+11, tbY=bCY-4;
+  var tc1x=tbX+20+Math.cos(tailAng)*18,   tc1y=tbY-16+Math.sin(tailAng)*8;
+  var tc2x=tbX+10+Math.cos(tailAng+.55)*22, tc2y=tbY-30+Math.sin(tailAng+.55)*10;
+  var ttX=tbX-3 +Math.cos(tailAng+1.0)*18,  ttY=tbY-42+Math.sin(tailAng+1.0)*8;
+
+  var tg=ctx.createLinearGradient(tbX,tbY,ttX,ttY);
+  tg.addColorStop(0,C.sqTD); tg.addColorStop(0.5,C.sqTL); tg.addColorStop(1,'#F5E0C0');
+  ctx.fillStyle=tg;
+  ctx.beginPath();
+  ctx.moveTo(tbX+5,tbY+3);
+  ctx.bezierCurveTo(tc1x+8,tc1y-2, tc2x+6,tc2y-4, ttX+6,ttY+1);
+  ctx.bezierCurveTo(tc2x-4,tc2y+9, tc1x-6,tc1y+8, tbX-3,tbY+7);
+  ctx.closePath(); ctx.fill();
+  // Fluffy tip
+  ctx.fillStyle='#FFF5E8';
+  ctx.beginPath(); ctx.arc(ttX+3,ttY,7,0,Math.PI*2); ctx.fill();
+
+  // ── BODY ──────────────────────────────────────────────
+  ctx.save();
+  ctx.translate(bCX,bCY); ctx.rotate(tilt);
+
+  // Back legs (behind body)
+  _sqLeg(-6, 5, bThigh, bShin, false);
+
+  // Body shape
+  var bg=ctx.createLinearGradient(-12,-12,12,14);
+  bg.addColorStop(0,C.sqLt); bg.addColorStop(1,C.sqDk);
+  ctx.fillStyle=bg;
+  ctx.beginPath(); _sqRRect(-13,-14,26,28,8); ctx.fill();
+  // Belly
+  ctx.fillStyle=C.sqCr;
+  ctx.beginPath(); ctx.ellipse(0,2,8,11,0,0,Math.PI*2); ctx.fill();
+  // Collar (pride green gradient)
+  var cg=ctx.createLinearGradient(-12,-14,12,-8);
+  cg.addColorStop(0,'#26D07C'); cg.addColorStop(1,'#078D70');
+  ctx.fillStyle=cg;
+  ctx.beginPath(); _sqRRect(-13,-15,26,7,3); ctx.fill();
+  // Collar badge
+  ctx.fillStyle=C.gold;
+  ctx.beginPath(); ctx.arc(0,-11,3,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='rgba(0,0,0,0.45)'; ctx.font='bold 4px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('*',0,-11);
+  // Front legs (in front of body)
+  _sqLeg(8, 5, fThigh, fShin, true);
+
+  ctx.restore(); // end body tilt
+
+  // ── HEAD ──────────────────────────────────────────────
+  ctx.save();
+  ctx.translate(hCX,hCY); ctx.rotate(tilt*0.6);
+
+  // Skull
+  var hg=ctx.createRadialGradient(-4,-5,1,0,0,18);
+  hg.addColorStop(0,C.sqLt); hg.addColorStop(1,C.sqMd);
+  ctx.fillStyle=hg;
+  ctx.beginPath(); ctx.ellipse(0,0,16,14,0,0,Math.PI*2); ctx.fill();
+
+  // Ears (left, right)
+  var ears=[[-6,-11,-13,-23,-17,-17,-12,-8],[6,-11,13,-23,17,-17,12,-8]];
+  for(var ei=0;ei<2;ei++){
+    var e=ears[ei], s=ei===0?-1:1;
+    ctx.fillStyle=C.sqMd;
+    ctx.beginPath(); ctx.moveTo(e[0],e[1]);
+    ctx.bezierCurveTo(e[2],e[3],e[4],e[5],e[6],e[7]);
+    ctx.lineTo(e[0],e[1]); ctx.closePath(); ctx.fill();
+    ctx.fillStyle=C.sqPk;
+    ctx.beginPath(); ctx.moveTo(e[0]+s,e[1]);
+    ctx.bezierCurveTo(e[2]*0.78,e[3]*0.82,e[4]*0.72,e[5]*0.88,e[6]+s,e[7]);
+    ctx.closePath(); ctx.fill();
+  }
+
+  // Eyes
+  ctx.fillStyle='#1a0a00';
+  ctx.beginPath(); ctx.arc(-6,-3,4,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc( 6,-3,4,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#fff';
+  ctx.beginPath(); ctx.arc(-4.5,-4.5,2,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(7.5,-4.5,2,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='rgba(255,255,255,.55)';
+  ctx.beginPath(); ctx.arc(-5,-3.5,.85,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(7,-3.5,.85,0,Math.PI*2); ctx.fill();
+
+  // Cheek blush
+  ctx.fillStyle='rgba(255,110,90,.2)';
+  ctx.beginPath(); ctx.ellipse(-11,2,5,3,0,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse( 11,2,5,3,0,0,Math.PI*2); ctx.fill();
+
+  // Nose
+  ctx.fillStyle=C.sqPk;
+  ctx.beginPath(); ctx.ellipse(0,7,5,3,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle=C.sqDk;
+  ctx.beginPath(); ctx.arc(-2,6.5,1.3,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc( 2,6.5,1.3,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle=C.sqDk; ctx.lineWidth=1.2;
+  ctx.beginPath(); ctx.arc(0,7.5,3.5,.1,Math.PI-.1); ctx.stroke();
+
+  ctx.restore();
+}
+
+// ── Leg renderer (called inside body transform context) ─
+function _sqLeg(hx, hy, thigh, shin, front) {
+  var L=13;
+  var kx=hx+Math.sin(thigh)*L, ky=hy+Math.cos(thigh)*L;
+  var fx=kx+Math.sin(thigh+shin)*L, fy=ky+Math.cos(thigh+shin)*L;
+  ctx.strokeStyle=front?C.sqLt:C.sqMd; ctx.lineWidth=5; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(hx,hy); ctx.lineTo(kx,ky); ctx.stroke();
+  ctx.lineWidth=4;
+  ctx.beginPath(); ctx.moveTo(kx,ky); ctx.lineTo(fx,fy); ctx.stroke();
+  ctx.fillStyle=C.sqDk;
+  ctx.beginPath(); ctx.ellipse(fx,fy+1,5,2.5,thigh*.3,0,Math.PI*2); ctx.fill();
+}
+
+// ── Rounded rect path helper ────────────────────────────
+function _sqRRect(x, y, w, h, r) {
+  if (ctx.roundRect) { ctx.roundRect(x,y,w,h,r); return; }
+  ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y); ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+  ctx.lineTo(x+w,y+h-r); ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+  ctx.lineTo(x+r,y+h); ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+  ctx.lineTo(x,y+r); ctx.quadraticCurveTo(x,y,x+r,y); ctx.closePath();
+}
+
 
 // ════════════════════════════════════════════════════════
 //  ACORN
@@ -1086,7 +1218,8 @@ function loop() {
 
   // Animate
   animTick++;
-  if(animTick%6===0) sq.af=(sq.af+1)%4;
+  var afRate=Math.max(3,Math.round(7-spd));
+  if(animTick%afRate===0) sq.af=(sq.af+1)%6;
 
   // Power-up timers
   if(puShield>0) puShield--;
@@ -1481,7 +1614,9 @@ async function buyExtraLife(){
     tx.add(makeCreateATA(wallet,recipATA,recipient,mintPk));
     tx.add(makeTransferChecked(senderATA,mintPk,recipATA,wallet,amount,zepDec));
 
-    var latest=await conn.getLatestBlockhash();
+    var bhRes=await fetch('/api/blockhash');
+    var latest=await bhRes.json();
+    if(latest.error) throw new Error('Could not fetch blockhash: '+latest.error);
     tx.recentBlockhash=latest.blockhash;
     tx.feePayer=wallet;
 
